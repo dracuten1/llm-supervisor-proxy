@@ -111,6 +111,15 @@ type upstreamRequest struct {
 	// so the handler observes it without a lock of its own.
 	deadlinePick bool
 
+	// poisoned (upstream pairing-rejection guard) — set ONLY by
+	// MarkPairingRejected when the attempt's buffer carries the anchored
+	// upstream pairing-rejection signature. Once set: the attempt can
+	// never be promoted to winner (GetError() != nil excludes it from
+	// every eligibility predicate) and execute() must not re-mark it
+	// completed (the executor goroutine may still be draining its
+	// upstream stream when the poison lands in live mode). Guarded by mu.
+	poisoned bool
+
 	// Cancellation state
 	cancelled  bool      // Set when Cancel() has been called
 	cancelOnce sync.Once // Ensures cleanup is only performed once
@@ -183,6 +192,58 @@ func (r *upstreamRequest) MarkFailed(err error) {
 	if r.buffer != nil {
 		r.buffer.Close(err)
 	}
+}
+
+// MarkPairingRejected poisons a winner-eligible attempt whose buffer
+// carries the upstream tool-call pairing-rejection signature
+// (pairing_guard.go). The attempt is flipped to failed with the
+// errUpstreamPairingRejection sentinel BEFORE it can be promoted to
+// winner or deadline-picked, so the signature text can never be relayed
+// to the client as a successful completion.
+//
+// Semantics beyond MarkFailed:
+//   - sets the poisoned flag — execute() checks it so a still-running
+//     executor goroutine cannot re-MarkCompleted (live mode: the poison
+//     lands on the FIRST buffered byte, while the executor is mid-stream)
+//     and cannot overwrite the sentinel via a late MarkFailed;
+//   - cancels the attempt context so the in-flight upstream read stops
+//     promptly (mirrors Cancel's ordering: cancel outside r.mu);
+//   - closes the buffer with the sentinel (CAS-guarded — if MarkCompleted
+//     already closed it with nil, the close is a no-op and the sentinel
+//     still lives in r.err).
+//
+// Idempotent + one-shot: returns false when the attempt was already
+// poisoned or already carries an error (never re-poison a loser).
+func (r *upstreamRequest) MarkPairingRejected(reason error) bool {
+	r.mu.Lock()
+	if r.poisoned || r.err != nil {
+		r.mu.Unlock()
+		return false
+	}
+	r.poisoned = true
+	r.status = statusFailed
+	r.err = reason
+	r.completionTime = time.Now()
+	cancel := r.cancel
+	r.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+
+	if buf := r.GetBuffer(); buf != nil {
+		buf.Close(reason)
+	}
+	return true
+}
+
+// IsPoisoned reports whether the pairing guard claimed this attempt
+// (MarkPairingRejected). Lock-protected: manage() writes it while the
+// executor goroutine reads it.
+func (r *upstreamRequest) IsPoisoned() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.poisoned
 }
 
 func (r *upstreamRequest) SetContext(ctx context.Context, cancel context.CancelFunc) {

@@ -83,6 +83,12 @@ const (
 	reasonClassProxyInternal = "proxy_internal" // proxy-side: resolution, no-credential, provider build, buffer cap
 	reasonClassCancelled     = "cancelled"      // context cancelled (race teardown — loser of the race)
 	reasonClassUnknown       = "unknown"        // nothing matched
+
+	// reasonClassPairingRejection (upstream pairing-rejection guard) —
+	// the upstream returned the tool-call pairing rejection AS a 200
+	// completion; the guard poisoned the attempt and re-drives the
+	// identical request. See pairing_guard.go.
+	reasonClassPairingRejection = "upstream_pairing_rejection"
 )
 
 // maxReasonDetailRunes caps the free-text `detail` segment. 160 was
@@ -184,6 +190,20 @@ func classifyAttemptFailure(err error, storedStatus int) failureReason {
 	// context was cancelled by cancelAllExcept. Not an upstream fault.
 	if errors.Is(err, context.Canceled) {
 		fr.Class = reasonClassCancelled
+		return fr
+	}
+
+	// 1b. Upstream pairing-rejection guard sentinel (pairing_guard.go) —
+	// the upstream answered 200 but the completion body is the anchored
+	// tool-call pairing-rejection signature text. Classified BEFORE the
+	// status families: the stored HTTP status is 200 (success-shaped) and
+	// must not route this to reasonClassUnknown, and there is no
+	// attributable HTTP error status (Status stays 0). Public vocabulary:
+	// `reason_class=upstream_pairing_rejection` greps both the poisoned
+	// attempt's race_request_failed payload and the pairing_retry
+	// re-drive's race_spawn payload.
+	if errors.Is(err, errUpstreamPairingRejection) {
+		fr.Class = reasonClassPairingRejection
 		return fr
 	}
 
