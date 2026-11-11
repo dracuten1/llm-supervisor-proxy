@@ -643,7 +643,14 @@ func handleInternalStream(ctx context.Context, provider providers.Provider, req 
 		// Check if the request was cancelled to exit promptly
 		// This ensures the goroutine exits immediately when Cancel() is called,
 		// even if context cancellation hasn't propagated yet
+		// Pairing-rejection guard: MarkPairingRejected also cancels the
+		// context — the poisoned check catches the window before the
+		// cancellation propagates, so the executor never keeps buffering
+		// signature frames into a buffer the guard closed.
 		if upstreamReq.IsCancelled() {
+			return context.Canceled
+		}
+		if upstreamReq.IsPoisoned() {
 			return context.Canceled
 		}
 

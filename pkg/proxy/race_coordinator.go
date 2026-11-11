@@ -104,6 +104,18 @@ const (
 	// trigger vocabulary — the race_spawn payload and the FE EventLog
 	// distinguish the classes by this field.
 	triggerQuota spawnTrigger = "quota_exceeded"
+
+	// triggerPairingRetry (upstream pairing-rejection guard) identifies
+	// the guard's same-model re-drive: a winner-eligible attempt
+	// completed with the anchored upstream pairing-rejection signature
+	// text delivered as a 200 completion (pairing_guard.go), was
+	// poisoned, and the race re-drives the IDENTICAL rawBody against the
+	// SAME model. The re-drive rides the modelTypeCredFailover row shape
+	// (same-model machinery, exempt from model-attempt accounting) but
+	// carries NO reselected credential — affinity resolution applies, so
+	// the resend is the same conversation request, not a credential
+	// rotation. Budget: pairingRetryMaxAttempts per race.
+	triggerPairingRetry spawnTrigger = "pairing_retry"
 )
 
 // triggerForClass maps a credential-failover class onto its spawn
@@ -278,6 +290,22 @@ type raceCoordinator struct {
 	// the MAIN attempt so the W-1 publish site can fire
 	// model_member_selected newlyBound-only.
 	groupPick *groupPickInfo
+
+	// Upstream pairing-rejection guard state (pairing_guard.go).
+	// Mutated only from manage() under c.mu — race-free by construction.
+	//
+	//   pairingRetriesSpawned — re-drives spawned this race (cap
+	//     pairingRetryMaxAttempts).
+	//   pairingRetryOwed — a poisoned attempt whose retry spawn was
+	//     deferred because RaceMaxParallel slots were occupied; retried
+	//     on the next tick before any new poison is considered.
+	//   pairingGuardExhausted — the cap is spent and a completion still
+	//     carries the signature; GetFinalErrorInfo appends the
+	//     exhaustion note to the client-visible message so the all-failed
+	//     path surfaces a REAL upstream error (never the signature text).
+	pairingRetriesSpawned int
+	pairingRetryOwed      *upstreamRequest
+	pairingGuardExhausted bool
 }
 
 func newRaceCoordinator(ctx context.Context, cfg *ConfigSnapshot, req *http.Request, rawBody []byte, models []string, interleaved bool) *raceCoordinator {
@@ -602,7 +630,19 @@ func (c *raceCoordinator) manage() {
 			// single-close semantics (:431), the deadline guard's reuse of
 			// the winner-nil check (:653-655), and the cancel-and-exit
 			// (:440-446) untouched. NO per-attempt atomic first-byte flag.
+			// Upstream pairing-rejection guard — set by the re-drive block
+			// below when THIS tick spawned a same-model pairing re-drive;
+			// suppresses the Case-1 fallback spawn and the all-failed
+			// terminal check for the tick (same defer pattern as
+			// spawnedCredFailover).
+			spawnedPairingRetry := false
+
 			if c.winner == nil {
+				// pairing-rejection guard (pairing_guard.go) — attempts
+				// poisoned by THIS tick's scan. One same-model re-drive
+				// spawns per tick (see the block after the scan).
+				var pairingPoisoned []*upstreamRequest
+
 				for i, req := range c.requests {
 					// Phase 2 / real-streaming-default — STRICT mode switch
 					// (review fix; plan :572-574, :640, CONSTRAINTS :609):
@@ -623,6 +663,47 @@ func (c *raceCoordinator) manage() {
 						eligible = req.IsCompleted() && req.GetError() == nil
 					}
 					if eligible {
+						// Upstream pairing-rejection guard — adjudicate the
+						// attempt buffer BEFORE promotion. The verdict is
+						// anchored-prefix exact over the accumulated
+						// assistant text (pairing_guard.go):
+						//
+						//   match   → poison the attempt (flip to failed
+						//             with the guard sentinel; cancel the
+						//             in-flight upstream read) and never
+						//             promote — the signature text must
+						//             not reach the client as a 200.
+						//   pending → still-streaming content that is a
+						//             proper prefix of a signature: hold
+						//             promotion for this tick; the next
+						//             tick sees divergence (→ promotable),
+						//             the full match (→ poisoned), or
+						//             completion (→ final adjudication).
+						//   none    → normal winner candidate.
+						switch pairingGuardVerdictForBuffer(req.GetBuffer()) {
+						case pairingGuardMatch:
+							if req.MarkPairingRejected(errUpstreamPairingRejection) {
+								// Mirrors execute()'s failure emission:
+								// same event keys + additive classified
+								// reason (upstream_pairing_rejection), so
+								// the EventLog treats the poisoned attempt
+								// as the upstream failure it is.
+								failReason := classifyRequestFailure(req)
+								log.Printf("[RACE] Request %d POISONED by pairing-rejection guard: %s", req.id, failReason)
+								c.publishEvent("race_request_failed", map[string]interface{}{
+									"request_index": req.id,
+									"model":         req.modelID,
+									"type":          string(req.modelType),
+									"error":         failReason.Detail,
+									"guard":         "pairing_rejection",
+								})
+								pairingPoisoned = append(pairingPoisoned, req)
+							}
+							continue
+						case pairingGuardPending:
+							continue
+						}
+
 						// We found a potential winner!
 						// Preference: earlier requests (lower index)
 						if c.winner == nil || i < c.winnerIdx {
@@ -645,6 +726,71 @@ func (c *raceCoordinator) manage() {
 							})
 
 							c.onceStream.Do(func() { close(c.streamCh) })
+						}
+					}
+				}
+
+				// Upstream pairing-rejection guard — RE-DRIVE (transparent
+				// retry) / EXHAUSTION. Runs only when NO winner emerged and
+				// this scan poisoned at least one attempt (or a previous
+				// tick's re-drive is still owed a free parallel slot).
+				//
+				// The re-drive re-sends the coordinator's rawBody VERBATIM
+				// (never mutated — the upstream mints the tool-call ids) to
+				// the SAME model, as a modelTypeCredFailover-shaped row
+				// (exempt from model-attempt accounting, does not consume
+				// the model chain). Precedence: the pairing re-drive beats
+				// the Case-1 credential/model fallback for a poisoned
+				// attempt — the upstream answered 200 and the request is
+				// healable by replay; when the budget is spent, the normal
+				// failure machinery (Case-1 chain advance / all-failed
+				// terminal) takes over untouched.
+				if c.winner == nil {
+					retryReq := c.pairingRetryOwed
+					if retryReq == nil && len(pairingPoisoned) > 0 {
+						retryReq = pairingPoisoned[len(pairingPoisoned)-1]
+					}
+					if retryReq != nil {
+						running := 0
+						for _, r := range c.requests {
+							if !r.IsDone() {
+								running++
+							}
+						}
+						if running >= c.cfg.RaceMaxParallel {
+							// No parallel slot free — owe the re-drive to
+							// the next tick (the poisoned attempt stays
+							// failed; nothing is relayed meanwhile).
+							c.pairingRetryOwed = retryReq
+						} else {
+							c.pairingRetryOwed = nil
+							if c.pairingRetriesSpawned < pairingRetryMaxAttempts {
+								c.pairingRetriesSpawned++
+								spawnedPairingRetry = true
+								failReason := classifyRequestFailure(retryReq)
+								log.Printf("[RACE] Pairing-rejection guard: re-driving identical rawBody against %s (retry %d/%d, failed attempt %d)",
+									retryReq.modelID, c.pairingRetriesSpawned, pairingRetryMaxAttempts, retryReq.id)
+								c.mu.Unlock()
+								c.spawn(modelTypeCredFailover, spawnTriggerInfo{
+									trigger:       triggerPairingRetry,
+									failedRequest: retryReq.id,
+									modelID:       retryReq.modelID,
+									reason:        failReason,
+								})
+								c.mu.Lock()
+							} else {
+								// EXHAUSTION: cap spent and a completion
+								// still carries the signature. No re-drive —
+								// fall through to the normal terminal
+								// machinery (all-failed → GetFinalErrorInfo
+								// → real 502 upstream_error to the client;
+								// the sentinel message + this note replace
+								// the signature text).
+								if !c.pairingGuardExhausted {
+									c.pairingGuardExhausted = true
+									log.Printf("[RACE] Pairing-rejection guard exhausted after %d re-drive(s); surfacing upstream error", pairingRetryMaxAttempts)
+								}
+							}
 						}
 					}
 				}
@@ -675,7 +821,15 @@ func (c *raceCoordinator) manage() {
 			credEligible := c.credFailoverEligibleLocked()
 			gate := modelAttempts < len(c.models) || credEligible
 			spawnedCredFailover := false
-			if c.winner == nil && gate {
+			// Pairing-rejection guard precedence: while this tick spawned
+			// a pairing re-drive (or one is owed a free parallel slot),
+			// the Case-1 credential/model fallback spawn is suppressed —
+			// the poisoned attempt is being healed by replay, and letting
+			// Case-1 fire in the same tick would double-spawn against it.
+			// When the guard is exhausted, pairingRetryOwed is nil and
+			// Case-1 proceeds untouched (chain advance / terminal).
+			guardOwnsSpawn := spawnedPairingRetry || c.pairingRetryOwed != nil
+			if c.winner == nil && gate && !guardOwnsSpawn {
 				running := 0
 				for _, r := range c.requests {
 					if !r.IsDone() {
@@ -857,7 +1011,11 @@ func (c *raceCoordinator) manage() {
 			// last) is TERMINAL — no spawn is scheduled and the
 			// all-failed resolution below fires; the legacy c.models[1]
 			// mapping survives only on the idle-timeout path.
-			if c.winner == nil && !spawnedCredFailover && modelAttempts >= len(c.models) {
+			//
+			// Pairing-rejection guard: a tick that just spawned a pairing
+			// re-drive also defers the terminal check (the re-drive row is
+			// still running — same reasoning as spawnedCredFailover).
+			if c.winner == nil && !spawnedCredFailover && !spawnedPairingRetry && modelAttempts >= len(c.models) {
 				allFailed := true
 				for _, r := range c.requests {
 					if !r.IsDone() || r.GetError() == nil {
@@ -929,11 +1087,31 @@ func (c *raceCoordinator) handleStreamingDeadline() {
 
 	// Find request with most content (best candidate to continue)
 	// If all buffers are equal, prefer the first (main) request
+	//
+	// Upstream pairing-rejection guard: match/pending candidates are NOT
+	// deadline-pickable. A match candidate is poisoned-bound (delivering
+	// it would relay the rejection text); a pending candidate is not yet
+	// adjudicable, and manage() returns after this method — so a held
+	// candidate can never be re-adjudicated later. Neither may win the
+	// deadline pick; if every candidate is guard-bound, the no-content
+	// error envelope below fires (a REAL upstream error beats a
+	// maybe-signature 200).
 	var best *upstreamRequest
 	var bestLen int64 = -1 // Start at -1 so first request always gets selected
 
 	for _, req := range c.requests {
 		if req != nil && !req.IsDone() {
+			if v := pairingGuardVerdictForBuffer(req.GetBuffer()); v != pairingGuardNone {
+				if v == pairingGuardMatch {
+					// Poison now — manage() exits after this method, so
+					// this is the last chance to mark the attempt failed.
+					req.MarkPairingRejected(errUpstreamPairingRejection)
+					log.Printf("[RACE] Deadline pick skipped request %d: pairing-rejection signature (poisoned)", req.id)
+				} else {
+					log.Printf("[RACE] Deadline pick skipped request %d: guard verdict pending", req.id)
+				}
+				continue
+			}
 			bufferLen := req.GetBuffer().TotalLen()
 			if bufferLen > bestLen {
 				best = req
@@ -1174,6 +1352,24 @@ func (c *raceCoordinator) execute(req *upstreamRequest) {
 
 	err := executeRequest(ctx, c.cfg, c.req, c.rawBody, req, c.interleaved, c.conversationKey, c.engine, publish)
 
+	// Upstream pairing-rejection guard: a poisoned attempt's terminal
+	// state belongs to the guard (manage() already flipped it to failed
+	// with errUpstreamPairingRejection and published race_request_failed).
+	// The executor here exits either mid-stream (poison cancelled the
+	// context) or with err==nil having buffered the signature frames —
+	// either way neither MarkFailed nor MarkCompleted may run: a late
+	// MarkFailed would overwrite the guard sentinel (breaking the
+	// exhaustion path's classified reason), and a late MarkCompleted
+	// would resurrect a poisoned attempt toward winner eligibility.
+	if req.IsPoisoned() {
+		if err != nil {
+			log.Printf("[RACE] Request %d executor exited after pairing-rejection poison (post-poison error discarded: %v)", req.id, err)
+		} else {
+			log.Printf("[RACE] Request %d buffered pairing-rejection frames before poison took effect — guard owns the terminal state", req.id)
+		}
+		return
+	}
+
 	if err != nil {
 		req.MarkFailed(err)
 		// Sticky last-success invalidation (winner-matched inside the
@@ -1409,6 +1605,15 @@ func (c *raceCoordinator) GetFinalErrorInfo() FinalErrorInfo {
 	message := "All upstream models failed"
 	if lastError != nil {
 		message = lastError.Error()
+	}
+
+	// Upstream pairing-rejection guard exhaustion — the final error is
+	// the guard sentinel (a poisoned attempt's text), so annotate WHY the
+	// client is seeing a real upstream error instead of a completion: the
+	// transparent re-drive budget was spent and every completion still
+	// carried the rejection signature.
+	if c.pairingGuardExhausted && lastError != nil && errors.Is(lastError, errUpstreamPairingRejection) {
+		message = lastError.Error() + " [guarded pairing-retry budget exhausted]"
 	}
 
 	// CRITICAL: Never add rate_limit code to context overflow errors
